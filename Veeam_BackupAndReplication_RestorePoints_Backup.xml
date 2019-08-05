@@ -12,7 +12,7 @@
         <collector>script</collector>
         <hasMultiInstances>true</hasMultiInstances>
         <schedule>1800</schedule>
-        <appliesTo>system.displayname == &#34;Veeam Backup - bc-veeam01&#34;</appliesTo>
+        <appliesTo>false();</appliesTo>
         <wildcardauto>true</wildcardauto>
         <wildcardpersist>false</wildcardpersist>
         <wildcardlinuxscript>ad_script</wildcardlinuxscript>
