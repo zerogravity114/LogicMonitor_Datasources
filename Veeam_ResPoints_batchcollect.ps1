@@ -1,6 +1,6 @@
 <# © 2007-2019 - LogicMonitor, Inc.  All rights reserved. #>
 
-$hostname               = '##system.hostname##'
+$hostname = '##system.hostname##'
 
 # If the hostname is an IP address query DNS for the FQDN
 if($hostname -match "\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"){
@@ -55,7 +55,19 @@ $Lookup.Add('Full',0)
 $Lookup.Add('Increment',1)
 
 ## ******** Beginning of LM Helper Methods *********************************************************************************************
+function Sanitize-Output {
+    param($Metric)
+    if ($Metric.GetType() -eq [Boolean]) {
+        return [int]$Metric
 
+    }
+
+    if ([string]::IsNullOrEmpty($Metric) -or [string]::IsNullOrWhiteSpace($Metric)) {
+        return "null"
+    } else {
+        return $Metric
+    }
+}
 function Get-VeeamConnection {
     Param (
         # Hostname of the Veeam Server we are connecting to.
