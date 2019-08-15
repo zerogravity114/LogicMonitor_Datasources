@@ -50,6 +50,10 @@ function Get-LMActiveDiscoveryOutput {
 return $lm_output
 }
 
+$Lookup = @{}
+$Lookup.Add('Full',0)
+$Lookup.Add('Increment',1)
+
 ## ******** Beginning of LM Helper Methods *********************************************************************************************
 
 function Get-VeeamConnection {
@@ -159,65 +163,95 @@ Function Get-VeeamRestorePoints {
         [string]$JobName
 
     )
-    # Retrieve the restore points
-    $RestorePoints = Get-VBRRestorePoint -ObjectId $VmId | Select-Object *
+    # Retrieve the restore points by VMiD and JobName
+    $RestorePoints = Get-VBRRestorePoint -ObjectId $VmId -Backup $JobName | Select-Object *
+
+    # Get a count of restore points. 
+    [int]$RestorePointCount = $RestorePoints.count
+    # If there is more than 1 RP, find the latest restore point, the fulls, and the increments
+    if ($RestorePointCount -gt 1) {
+
+        # Find the latest consistent Full or Simple restore point and report its size in bytes, type 1=Full 2=Increment 3=Debug, and age in seconds
+        $LatestRp = $RestorePoints | ? {$_.IsConsistent -eq "True"} | Sort-Object CreationTimeUtc | Select-Object -Last 1
+        [datetime]$LatestCreationTimeUtc = $LatestRp.CreationTimeUtc
+        [int64]$LatestAgeSec = (New-Timespan -Start $LatestCreationTimeUtc -End $Now).TotalSeconds
+        [string]$LatestType = $LatestRp.Type
+        [string]$TypeReturn = $Lookup.$($LatestType)
+        [string]$LatestSize = $LatestRp.ApproxSize
     
-    # Find the latest consistent Full or Simple restore point and report its size in bytes, type 1=Full 2=Increment 3=Debug, and age in seconds
-    $LatestRp = $RestorePoints | ? {$_.IsConsistent -eq "True"} | Sort-Object CreationTimeUtc | Select-Object -Last 1
-    [datetime]$LatestCreationTimeUtc = $LatestRp.CreationTimeUtc
-    [int64]$LatestAgeSec = (New-Timespan -Start $LatestCreationTimeUtc -End $Now).TotalSeconds
+        # Find the Full restore points and count them.  Excluded "inconsistent/incomplete" fulls
+        $Fulls = $RestorePoints | ? {$_.Type -eq "Full"} | ? {$_.IsConsistent -eq "True"}
+        $FullCount = $Fulls.Count
 
-    
-    # Find the Full restore points and count them.  Excluded "inconsistent/incomplete" fulls
-    $Fulls = $RestorePoints | ? {$_.Type -eq "Full"} | ? {$_.IsConsistent -eq "True"}
-    $FullCount = $Fulls.Count
+        # Find the backup increments and cound them. Exclude "inconsistent/incomplete" increments
+        $Increments = $RestorePoints | ? {$_.Type -eq "Increment"} | ? {$_.IsConsistent -eq "True"}
+        $IncrementCount = $Increments.Count
 
-    # Find the backup increments and cound them. Exclude "inconsistent/incomplete" increments
-    $Increments = $RestorePoints | ? {$_.Type -eq "Increment"} | ? {$_.IsConsistent -eq "True"}
-    $IncrementCount = $Increments.Count
-
-    # Sort the fulls so we can pull the newest and oldest
-   $Fulls = $Fulls | Sort-Object CreationTimeUtc
-   $OldestFull = $Fulls | Select-Object -First 1
-   $NewestFull = $Fulls | Select-Object -Last 1
+        # Sort the fulls so we can pull the newest and oldest
+       $Fulls = $Fulls | Sort-Object CreationTimeUtc
+       $OldestFull = $Fulls | Select-Object -First 1
+       $NewestFull = $Fulls | Select-Object -Last 1
    
-   # Find the creationdata of the oldest full and return in in epoch time
-   [datetime]$OldFullCreationUtc = $OldestFull.CreationTimeUtc
-   #[int64]$OldFullEpochTime = (New-Timespan -Start $EpochStart -End $OldFullCreationUtc).TotalSeconds
-   [int64]$OldFullAgeSec = (New-Timespan -Start $OldFullCreationUtc -End $Now).TotalSeconds
+       # Find the creationdata of the oldest full and return in in epoch time
+       [datetime]$OldFullCreationUtc = $OldestFull.CreationTimeUtc
+       #[int64]$OldFullEpochTime = (New-Timespan -Start $EpochStart -End $OldFullCreationUtc).TotalSeconds
+       [int64]$OldFullAgeSec = (New-Timespan -Start $OldFullCreationUtc -End $Now).TotalSeconds
 
-   # Find the creationdate of the newest full and return it in Unix Epoch time
-   [datetime]$NewFullCreationUtc = $NewestFull.CreationTimeUtc
-   # [int64]$NewFullEpochTime = (New-TimeSpan -Start $EpochStart -End $NewFullCreationUtc).TotalSeconds
-   [int64]$NewFullAgeSec = (New-Timespan -Start $NewFullCreationUtc -End $Now).TotalSeconds
+       # Find the creationdate of the newest full and return it in Unix Epoch time
+       [datetime]$NewFullCreationUtc = $NewestFull.CreationTimeUtc
+       # [int64]$NewFullEpochTime = (New-TimeSpan -Start $EpochStart -End $NewFullCreationUtc).TotalSeconds
+       [int64]$NewFullAgeSec = (New-Timespan -Start $NewFullCreationUtc -End $Now).TotalSeconds
    
 
-   # Sort the incremenets so we can pull the newest and oldest
-   $Increments = $Increments | Sort-Object CreationTimeUtc
-   $OldestIncrement = $Increments | Select-Object -First 1
-   $NewestIncrement = $Increments | Select-Object -Last 1
+       # Sort the incremenets so we can pull the newest and oldest
+       $Increments = $Increments | Sort-Object CreationTimeUtc
+       $OldestIncrement = $Increments | Select-Object -First 1
+       $NewestIncrement = $Increments | Select-Object -Last 1
 
-   #Find the creationdate of the oldest increment and return in epoch time
-   [datetime]$OldIncrementCreationUtc = $OldestIncrement.CreationTimeUtc
-   # [int64]$OldIncEpochTime = (New-Timespan -Start $EpochStart -End $OldIncrementCreationUtc).TotalSeconds
-   [int64]$OldIncAgeSec = (New-Timespan -Start $OldIncrementCreationUtc -End $Now).TotalSeconds
+       #Find the creationdate of the oldest increment and return in epoch time
+       [datetime]$OldIncrementCreationUtc = $OldestIncrement.CreationTimeUtc
+       # [int64]$OldIncEpochTime = (New-Timespan -Start $EpochStart -End $OldIncrementCreationUtc).TotalSeconds
+       [int64]$OldIncAgeSec = (New-Timespan -Start $OldIncrementCreationUtc -End $Now).TotalSeconds
 
 
-   # Find the creationdate of the newest increment and return in epoch time
-   [datetime]$NewIncrementCreationUtc = $NewestIncrement.CreationTimeUtc
-   # [int64]$NewIncEpochTime = (New-TimeSpan -Start $EpochStart -End $NewIncrementCreationUtc).TotalSeconds
-   [int64]$NewIncAgeSec = (New-Timespan -Start $NewIncrementCreationUtc -End $Now).TotalSeconds
+       # Find the creationdate of the newest increment and return in epoch time
+       [datetime]$NewIncrementCreationUtc = $NewestIncrement.CreationTimeUtc
+       # [int64]$NewIncEpochTime = (New-TimeSpan -Start $EpochStart -End $NewIncrementCreationUtc).TotalSeconds
+       [int64]$NewIncAgeSec = (New-Timespan -Start $NewIncrementCreationUtc -End $Now).TotalSeconds
 
-   # Write out the data to return to Logicmonitor
-   # Write-Host "$( $wildvalue ).Status=$( Sanitize-Output $task.Status )"
+       # Write out the data to return to Logicmonitor
+       # Write-Host "$( $wildvalue ).Status=$( Sanitize-Output $task.Status )"
+      
+       Write-Host "$( $VmId ).LatestType=$( Sanitize-Output $TypeReturn )"
+       Write-Host "$( $VmId ).LatestSize=$( Sanitize-Output $LatestSize )"
+       Write-Host "$( $VmId ).FullCount=$( Sanitize-Output $FullCount )"
+       Write-Host "$( $VmId ).IncCount=$( Sanitize-Output $IncrementCount )"
+       Write-Host "$( $VmId ).OldestFull=$( Sanitize-Output $OldFullAgeSec )"
+       Write-Host "$( $VmId ).NewestFull=$( Sanitize-Output $NewFullAgeSec )"
+       Write-Host "$( $VmId ).OldestIncrement=$( Sanitize-Output $OldIncAgeSec )"
+       Write-Host "$( $VmId ).NewestIncrement=$( Sanitize-Output $NewIncAgeSec )"
 
-   Write-Host "$( $VmId ).FullCount=$( Sanitize-Output $FullCount )"
-   Write-Host "$( $VmId ).IncCount=$( Sanitize-Output $IncrementCount )"
-   Write-Host "$( $VmId ).OldestFull=$( Sanitize-Output $OldFullAgeSec )"
-   Write-Host "$( $VmId ).NewestFull=$( Sanitize-Output $NewFullAgeSec )"
-   Write-Host "$( $VmId ).OldestIncrement=$( Sanitize-Output $OldIncAgeSec )"
-   Write-Host "$( $VmId ).NewestIncrement=$( Sanitize-Output $NewIncAgeSec )"
+       }
+       # Else, pull stats for the single restore point
+       else {
+       $LatestRp = $RestorePoints
 
+        [datetime]$LatestCreationTimeUtc = $LatestRp.CreationTimeUtc
+        [int64]$LatestAgeSec = (New-Timespan -Start $LatestCreationTimeUtc -End $Now).TotalSeconds
+        [string]$LatestType = $LatestRp.Type
+        [string]$TypeReturn = $Lookup.$($LatestType)
+        [string]$LatestSize = $LatestRp.ApproxSize
+        
+        Write-Host "$( $VmId ).LatestType=$( Sanitize-Output $TypeReturn )"
+        Write-Host "$( $VmId ).LatestSize=$( Sanitize-Output $LatestSize )"
+        Write-Host "$( $VmId ).FullCount=$( Sanitize-Output "1" )"
+        Write-Host "$( $VmId ).IncCount=$( Sanitize-Output "0" )"
+        Write-Host "$( $VmId ).OldestFull=$( Sanitize-Output $LatestAgeSec )"
+        Write-Host "$( $VmId ).NewestFull=$( Sanitize-Output $LatestAgeSec )"
+        Write-Host "$( $VmId ).OldestIncrement=$( Sanitize-Output "0" )"
+        Write-Host "$( $VmId ).NewestIncrement=$( Sanitize-Output "0" )"
+
+       }
 }
 
 
@@ -235,7 +269,8 @@ Function Get-VeeamRestorePoints {
 $veeam_objects = Get-VeeamVirtualMachines -VeeamSession $veeam_session -JobType "Backup"
 
 Foreach ($vm in $veeam_objects) {
-Get-VeeamRestorePoints -VmId $vm.ObjectID -JobName $vm.BackupJobName
+    Write-Warning "Starting VM $($vm.VmName)"
+    Get-VeeamRestorePoints -VmId $vm.ObjectID -JobName $vm.BackupJobName
 
 
 }
