@@ -5,14 +5,14 @@
   <errmsg>OK</errmsg>
   <interval>0</interval>
     <entry type="predatasource">
-        <version>1565041352</version>
+        <version>1565911170</version>
         <name>Veeam_BackupAndReplication_RestorePoints_Backup</name>
-        <displayedas>Veeam Restore Points: Backup</displayedas>
-        <description></description>
-        <collector>script</collector>
+        <displayedas>Veeam_BackupAndReplication_RestorePoints_Backup-</displayedas>
+        <description>Pulls Backup Job restore points for Veeam Backup and Replication VMs that are included in all Backup Jobs.</description>
+        <collector>batchscript</collector>
         <hasMultiInstances>true</hasMultiInstances>
-        <schedule>1800</schedule>
-        <appliesTo>false();</appliesTo>
+        <schedule>3600</schedule>
+        <appliesTo>system.displayname == &#34;Veeam Backup - bc-veeam01&#34;</appliesTo>
         <wildcardauto>true</wildcardauto>
         <wildcardpersist>false</wildcardpersist>
         <wildcardlinuxscript>ad_script</wildcardlinuxscript>
@@ -30,6 +30,11 @@ if($hostname -match &#34;\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b&#34;){
 
 if ([string]::IsNullOrEmpty(&#39;##veeam.user##&#39;)) { $veeam_user = &#39;##wmi.user##&#39; } else { $veeam_user = &#39;##veeam.user##&#39; }
 if ([string]::IsNullOrEmpty(&#39;##veeam.pass##&#39;)) { $veeam_pass = &#39;##wmi.pass##&#39; } else { $veeam_pass = &#39;##veeam.pass##&#39; }
+
+# Store a date stamp for calculating the age of the restore points
+[datetime]$Now = Get-Date
+$Now = $Now.ToUniversalTime()
+
 
 ## ******** Beginning of LM Helper Methods *****************************************************************************************
 
@@ -65,6 +70,10 @@ function Get-LMActiveDiscoveryOutput {
 
 return $lm_output
 }
+
+$Lookup = @{}
+$Lookup.Add(&#39;Full&#39;,0)
+$Lookup.Add(&#39;Increment&#39;,1)
 
 ## ******** Beginning of LM Helper Methods *********************************************************************************************
 
@@ -117,22 +126,24 @@ function Get-VeeamConnection {
         Write-Host &#34;Error connecting session.  Terminating.&#34;
         Exit
     }
-
+    Invoke-Command -Session $veeam_session -ScriptBlock {Add-PSSnapin -Name VeeamPSSnapIn -WarningAction SilentlyContinue -ErrorAction SilentlyContinue}
     return $veeam_session
 }
 
 function Get-VeeamVirtualMachines {
     
     Param (
-        # Veeam Session Object
         [Parameter(Mandatory = $true)]
         [System.Management.Automation.Runspaces.PSSession]
-        $VeeamSession
+        $VeeamSession,
+
+        [Parameter(Mandatory= $true)]
+        [string]$JobType
         
     )
 
     $tmp_veeam_objects = @()
-
+    &#60;#
     ## Make the call to the Veeam PS cmdlet to retrieve the backup jobs
     $vjs = Invoke-Command -Session $VeeamSession -ScriptBlock {
         Add-PSSnapin -Name VeeamPSSnapIn -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
@@ -141,27 +152,29 @@ function Get-VeeamVirtualMachines {
         $RemoteJobs = Get-VBRJob -WarningAction SilentlyContinue | Where-Object { $_.JobType -eq &#34;Backup&#34; } | Select-Object -Property *
         ForEach ($Job in $RemoteJobs) {Get-VBRJobObject -Job $Job.Name | ? {$_.Type -eq &#34;Include&#34;}}
     
-    }
+    }#&#62; #Replace this section with a PS Session.  Working on code below.
 
-
-
-## VBuild an array of Virtual Machines Instances by checking each job for included VMs
-foreach ($vjob in $vjs) {
+    # $RemoteJobs = Get-VBRJob -WarningAction SilentlyContinue | Where-Object { $_.JobType -eq $JobType } | Select-Object -Property *
+    $RemoteJobs = Invoke-Command -Session $VeeamSession -ScriptBlock {Get-VBRJob -WarningAction SilentlyContinue | Where-Object { $_.JobType -eq $Using:JobType } | Select-Object -Property *}
     
-    $new_veeam_vm = New-Object -TypeName psobject
-    $new_veeam_vm | Add-Member NoteProperty -Name ObjectID -Value $vjob.ObjectId
-    $new_veeam_vm | Add-Member NoteProperty -Name VmName -Value $vjob.Name
-    $new_veeam_vm | Add-Member NoteProperty -Name Location -Value $vjob.Location
-
-    $tmp_veeam_objects += $new_veeam_vm
-
-
-
+    ForEach ($Job in $RemoteJobs) {
+        $JobName = $Job.Name
+        #Collect the Job Objects and build a table of virtual machines
+        $JobObjects = Invoke-Command -Session $VeeamSession -ScriptBlock {Get-VBRJobObject -Job $Using:JobName | ? {$_.Type -eq &#34;Include&#34;}}
+        ForEach ($vm in $JobObjects) {
+            $new_veeam_vm = New-Object -TypeName psobject
+            $new_veeam_vm | Add-Member NoteProperty -Name ObjectID -Value $vm.ObjectId
+            $new_veeam_vm | Add-Member NoteProperty -Name VmName -Value $vm.Name
+            $new_veeam_vm | Add-Member NoteProperty -Name Location -Value $vm.Location
+            $new_veeam_vm | Add-Member NoteProperty -Name BackupJobId -Value $vm.JobID
+            $new_veeam_vm | Add-Member NoteProperty -Name BackupJobName -Value $JobName
+            $new_veeam_vm | Add-Member NoteProperty -Name BackupJobType -Value $JobType
+            $tmp_veeam_objects += $new_veeam_vm
+        }
+    
+    }
+    return $tmp_veeam_objects
 }
-
-return $tmp_veeam_objects
-}
-
 
 
 
@@ -169,12 +182,12 @@ return $tmp_veeam_objects
 # Add-PSSnapin -Name VeeamPSSnapIn -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
 $veeam_session = Get-VeeamConnection -VeeamHostname $hostname -VeeamUsername $veeam_user -VeeamPassword $veeam_pass
 
-$veeam_objects = Get-VeeamVirtualMachines -VeeamSession $veeam_session
+# Get the Veeam Virtual Machines included in Backup Jobs
+$veeam_objects = Get-VeeamVirtualMachines -VeeamSession $veeam_session -JobType &#34;Backup&#34;
 
-Write-Host ( Get-LMActiveDiscoveryOutput -VeeamObjects $veeam_objects )
+Get-LMActiveDiscoveryOutput -VeeamObjects $veeam_objects
 
-Exit
-</wildcardgroovyscript>
+Exit</wildcardgroovyscript>
         <wildcardschedule>1440</wildcardschedule>
         <wildcarddisable>false</wildcarddisable>
         <wildcarddeleteinactive>false</wildcarddeleteinactive>
@@ -183,7 +196,7 @@ Exit
         <group></group>
         <tags></tags>
         <technology></technology>
-        <adlist><![CDATA[{"agdmethod":"none","method":"ad_script","agdparams":"","id":0,"filters":[],"params":{"type":"powerShell","groovyscript":"<# © 2007-2019 - LogicMonitor, Inc.  All rights reserved. #>\n\n$hostname               = '##system.hostname##'\n\n# If the hostname is an IP address query DNS for the FQDN\nif($hostname -match \"\\b\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\b\"){\n    $hostname = [System.Net.Dns]::GetHostbyAddress($hostname).HostName\n}\n\nif ([string]::IsNullOrEmpty('##veeam.user##')) { $veeam_user = '##wmi.user##' } else { $veeam_user = '##veeam.user##' }\nif ([string]::IsNullOrEmpty('##veeam.pass##')) { $veeam_pass = '##wmi.pass##' } else { $veeam_pass = '##veeam.pass##' }\n\n## ******** Beginning of LM Helper Methods *****************************************************************************************\n\nfunction Make-NotNaN {\n    param( $Metric )\n\n    if ( [string]::IsNullOrEmpty($Metric) -or [string]::IsNullOrWhiteSpace($Metric) ) {\n        return \"0\" \n    } else {\n        return $Metric \n    }\n}\n\nfunction Get-LMActiveDiscoveryOutput {\n    Param (\n        # Custom Hashtable of Objects representing the Veeam Jobs.\n        [Parameter(Mandatory = $true)]\n        $VeeamObjects\n    )\n\n    $lm_output = \"\"\n\n    # Now Print out the AD-Formatted output\n    ForEach ($VeeamObject in $VeeamObjects) {\n           $tmp_VmID = $VeeamObject.ObjectID\n           $tmp_VmName = $VeeamObject.VmName\n           $tmp_Location = $VeeamObject.Location\n           $tmp_propprefix = \"auto.veeam.backupandreplication\"\n        \n        $lm_output += \"$($tmp_VmID)##$($tmp_VmName)##$($tmp_Location)####$($tmp_propprefix).vmobjectid=$($tmp_VmID)&$($tmp_propprefix).virtualmachinename=$($tmp_VmName)&$($tmp_propprefix).vmlocation=$($tmp_Location)`n\"\n\n    }\n\nreturn $lm_output\n}\n\n## ******** Beginning of LM Helper Methods *********************************************************************************************\n\nfunction Get-VeeamConnection {\n    Param (\n        # Hostname of the Veeam Server we are connecting to.\n        [Parameter(Mandatory = $true)]\n        [string]\n        $VeeamHostname,\n\n        # Veeam Username\n        [Parameter(Mandatory = $true)]\n        [string]\n        $VeeamUsername,\n\n        # Veeam Password\n        [Parameter(Mandatory = $true)]\n        [String]\n        $VeeamPassword\n    )\n\n    $max_attempts = 2\n    $attempt_sleep = 2\n    $current_attempt_count = 0\n\n    ## Build credential object\n    If (($VeeamUsername -like \"*veeam.user*\") -or ($VeeamUsername -like \"*wmi.user*\")) {\n        # The user has not provided any creds. Let's try with whatever user this thing has.\n        while (-Not$veeam_session -and ($current_attempt_count -le $max_attempts)) {\n            $current_attempt_count++\n            $veeam_session = New-PSSession -ComputerName $VeeamHostname\n            Start-Sleep -Seconds $attempt_sleep\n        }\n    }\n\n    else {\n        $secure_pass = ConvertTo-SecureString -String $VeeamPassword -AsPlainText -Force\n        $creds = New-Object -typename System.Management.Automation.PSCredential($VeeamUsername, $secure_pass)\n\n        ## Attempt to acquire a persistent session object.  Keep trying until we hit the $max_attempts value.\n        while (-Not$veeam_session -and ($current_attempt_count -le $max_attempts)) {\n            $current_attempt_count++\n            $veeam_session = New-PSSession -ComputerName $VeeamHostname -Credential $creds\n            Start-Sleep -Seconds $attempt_sleep\n        }\n    }\n\n    ## Ensure that the session was successfully created, otherwise exit.\n    if ( -Not $veeam_session ) {\n        Write-Host \"Error connecting session.  Terminating.\"\n        Exit\n    }\n\n    return $veeam_session\n}\n\nfunction Get-VeeamVirtualMachines {\n    \n    Param (\n        # Veeam Session Object\n        [Parameter(Mandatory = $true)]\n        [System.Management.Automation.Runspaces.PSSession]\n        $VeeamSession\n        \n    )\n\n    $tmp_veeam_objects = @()\n\n    ## Make the call to the Veeam PS cmdlet to retrieve the backup jobs\n    $vjs = Invoke-Command -Session $VeeamSession -ScriptBlock {\n        Add-PSSnapin -Name VeeamPSSnapIn -WarningAction SilentlyContinue -ErrorAction SilentlyContinue\n        \n   \n        $RemoteJobs = Get-VBRJob -WarningAction SilentlyContinue | Where-Object { $_.JobType -eq \"Backup\" } | Select-Object -Property *\n        ForEach ($Job in $RemoteJobs) {Get-VBRJobObject -Job $Job.Name | ? {$_.Type -eq \"Include\"}}\n    \n    }\n\n\n\n## VBuild an array of Virtual Machines Instances by checking each job for included VMs\nforeach ($vjob in $vjs) {\n    \n    $new_veeam_vm = New-Object -TypeName psobject\n    $new_veeam_vm | Add-Member NoteProperty -Name ObjectID -Value $vjob.ObjectId\n    $new_veeam_vm | Add-Member NoteProperty -Name VmName -Value $vjob.Name\n    $new_veeam_vm | Add-Member NoteProperty -Name Location -Value $vjob.Location\n\n    $tmp_veeam_objects += $new_veeam_vm\n\n\n\n}\n\nreturn $tmp_veeam_objects\n}\n\n\n\n\n## ******** Beginning of the main routine *********************************************************************************************\n# Add-PSSnapin -Name VeeamPSSnapIn -WarningAction SilentlyContinue -ErrorAction SilentlyContinue\n$veeam_session = Get-VeeamConnection -VeeamHostname $hostname -VeeamUsername $veeam_user -VeeamPassword $veeam_pass\n\n$veeam_objects = Get-VeeamVirtualMachines -VeeamSession $veeam_session\n\nWrite-Host ( Get-LMActiveDiscoveryOutput -VeeamObjects $veeam_objects )\n\nExit\n"}}]]></adlist>
+        <adlist><![CDATA[{"agdmethod":"none","method":"ad_script","agdparams":"","id":0,"filters":[],"params":{"type":"powerShell","groovyscript":"<# © 2007-2019 - LogicMonitor, Inc.  All rights reserved. #>\n\n$hostname               = '##system.hostname##'\n\n# If the hostname is an IP address query DNS for the FQDN\nif($hostname -match \"\\b\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\b\"){\n    $hostname = [System.Net.Dns]::GetHostbyAddress($hostname).HostName\n}\n\nif ([string]::IsNullOrEmpty('##veeam.user##')) { $veeam_user = '##wmi.user##' } else { $veeam_user = '##veeam.user##' }\nif ([string]::IsNullOrEmpty('##veeam.pass##')) { $veeam_pass = '##wmi.pass##' } else { $veeam_pass = '##veeam.pass##' }\n\n# Store a date stamp for calculating the age of the restore points\n[datetime]$Now = Get-Date\n$Now = $Now.ToUniversalTime()\n\n\n## ******** Beginning of LM Helper Methods *****************************************************************************************\n\nfunction Make-NotNaN {\n    param( $Metric )\n\n    if ( [string]::IsNullOrEmpty($Metric) -or [string]::IsNullOrWhiteSpace($Metric) ) {\n        return \"0\" \n    } else {\n        return $Metric \n    }\n}\n\nfunction Get-LMActiveDiscoveryOutput {\n    Param (\n        # Custom Hashtable of Objects representing the Veeam Jobs.\n        [Parameter(Mandatory = $true)]\n        $VeeamObjects\n    )\n\n    $lm_output = \"\"\n\n    # Now Print out the AD-Formatted output\n    ForEach ($VeeamObject in $VeeamObjects) {\n           $tmp_VmID = $VeeamObject.ObjectID\n           $tmp_VmName = $VeeamObject.VmName\n           $tmp_Location = $VeeamObject.Location\n           $tmp_propprefix = \"auto.veeam.backupandreplication\"\n        \n        $lm_output += \"$($tmp_VmID)##$($tmp_VmName)##$($tmp_Location)####$($tmp_propprefix).vmobjectid=$($tmp_VmID)&$($tmp_propprefix).virtualmachinename=$($tmp_VmName)&$($tmp_propprefix).vmlocation=$($tmp_Location)`n\"\n\n    }\n\nreturn $lm_output\n}\n\n$Lookup = @{}\n$Lookup.Add('Full',0)\n$Lookup.Add('Increment',1)\n\n## ******** Beginning of LM Helper Methods *********************************************************************************************\n\nfunction Get-VeeamConnection {\n    Param (\n        # Hostname of the Veeam Server we are connecting to.\n        [Parameter(Mandatory = $true)]\n        [string]\n        $VeeamHostname,\n\n        # Veeam Username\n        [Parameter(Mandatory = $true)]\n        [string]\n        $VeeamUsername,\n\n        # Veeam Password\n        [Parameter(Mandatory = $true)]\n        [String]\n        $VeeamPassword\n    )\n\n    $max_attempts = 2\n    $attempt_sleep = 2\n    $current_attempt_count = 0\n\n    ## Build credential object\n    If (($VeeamUsername -like \"*veeam.user*\") -or ($VeeamUsername -like \"*wmi.user*\")) {\n        # The user has not provided any creds. Let's try with whatever user this thing has.\n        while (-Not$veeam_session -and ($current_attempt_count -le $max_attempts)) {\n            $current_attempt_count++\n            $veeam_session = New-PSSession -ComputerName $VeeamHostname\n            Start-Sleep -Seconds $attempt_sleep\n        }\n    }\n\n    else {\n        $secure_pass = ConvertTo-SecureString -String $VeeamPassword -AsPlainText -Force\n        $creds = New-Object -typename System.Management.Automation.PSCredential($VeeamUsername, $secure_pass)\n\n        ## Attempt to acquire a persistent session object.  Keep trying until we hit the $max_attempts value.\n        while (-Not$veeam_session -and ($current_attempt_count -le $max_attempts)) {\n            $current_attempt_count++\n            $veeam_session = New-PSSession -ComputerName $VeeamHostname -Credential $creds\n            Start-Sleep -Seconds $attempt_sleep\n        }\n    }\n\n    ## Ensure that the session was successfully created, otherwise exit.\n    if ( -Not $veeam_session ) {\n        Write-Host \"Error connecting session.  Terminating.\"\n        Exit\n    }\n    Invoke-Command -Session $veeam_session -ScriptBlock {Add-PSSnapin -Name VeeamPSSnapIn -WarningAction SilentlyContinue -ErrorAction SilentlyContinue}\n    return $veeam_session\n}\n\nfunction Get-VeeamVirtualMachines {\n    \n    Param (\n        [Parameter(Mandatory = $true)]\n        [System.Management.Automation.Runspaces.PSSession]\n        $VeeamSession,\n\n        [Parameter(Mandatory= $true)]\n        [string]$JobType\n        \n    )\n\n    $tmp_veeam_objects = @()\n    <#\n    ## Make the call to the Veeam PS cmdlet to retrieve the backup jobs\n    $vjs = Invoke-Command -Session $VeeamSession -ScriptBlock {\n        Add-PSSnapin -Name VeeamPSSnapIn -WarningAction SilentlyContinue -ErrorAction SilentlyContinue\n        \n   \n        $RemoteJobs = Get-VBRJob -WarningAction SilentlyContinue | Where-Object { $_.JobType -eq \"Backup\" } | Select-Object -Property *\n        ForEach ($Job in $RemoteJobs) {Get-VBRJobObject -Job $Job.Name | ? {$_.Type -eq \"Include\"}}\n    \n    }#> #Replace this section with a PS Session.  Working on code below.\n\n    # $RemoteJobs = Get-VBRJob -WarningAction SilentlyContinue | Where-Object { $_.JobType -eq $JobType } | Select-Object -Property *\n    $RemoteJobs = Invoke-Command -Session $VeeamSession -ScriptBlock {Get-VBRJob -WarningAction SilentlyContinue | Where-Object { $_.JobType -eq $Using:JobType } | Select-Object -Property *}\n    \n    ForEach ($Job in $RemoteJobs) {\n        $JobName = $Job.Name\n        #Collect the Job Objects and build a table of virtual machines\n        $JobObjects = Invoke-Command -Session $VeeamSession -ScriptBlock {Get-VBRJobObject -Job $Using:JobName | ? {$_.Type -eq \"Include\"}}\n        ForEach ($vm in $JobObjects) {\n            $new_veeam_vm = New-Object -TypeName psobject\n            $new_veeam_vm | Add-Member NoteProperty -Name ObjectID -Value $vm.ObjectId\n            $new_veeam_vm | Add-Member NoteProperty -Name VmName -Value $vm.Name\n            $new_veeam_vm | Add-Member NoteProperty -Name Location -Value $vm.Location\n            $new_veeam_vm | Add-Member NoteProperty -Name BackupJobId -Value $vm.JobID\n            $new_veeam_vm | Add-Member NoteProperty -Name BackupJobName -Value $JobName\n            $new_veeam_vm | Add-Member NoteProperty -Name BackupJobType -Value $JobType\n            $tmp_veeam_objects += $new_veeam_vm\n        }\n    \n    }\n    return $tmp_veeam_objects\n}\n\n\n\n## ******** Beginning of the main routine *********************************************************************************************\n# Add-PSSnapin -Name VeeamPSSnapIn -WarningAction SilentlyContinue -ErrorAction SilentlyContinue\n$veeam_session = Get-VeeamConnection -VeeamHostname $hostname -VeeamUsername $veeam_user -VeeamPassword $veeam_pass\n\n# Get the Veeam Virtual Machines included in Backup Jobs\n$veeam_objects = Get-VeeamVirtualMachines -VeeamSession $veeam_session -JobType \"Backup\"\n\nGet-LMActiveDiscoveryOutput -VeeamObjects $veeam_objects\n\nExit"}}]]></adlist>
         <schemaVersion>2</schemaVersion>
         <dataSourceType>1</dataSourceType>
         <attributes>
@@ -206,10 +219,9 @@ if($hostname -match &#34;\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b&#34;){
 if ([string]::IsNullOrEmpty(&#39;##veeam.user##&#39;)) { $veeam_user = &#39;##wmi.user##&#39; } else { $veeam_user = &#39;##veeam.user##&#39; }
 if ([string]::IsNullOrEmpty(&#39;##veeam.pass##&#39;)) { $veeam_pass = &#39;##wmi.pass##&#39; } else { $veeam_pass = &#39;##veeam.pass##&#39; }
 
-[datetime]$EpochStart = Get-Date &#34;01/01/1970&#34;
+# Store a date stamp for calculating the age of the restore points
 [datetime]$Now = Get-Date
-
-$VmId = &#34;##WILDVALUE##&#34;
+$Now = $Now.ToUniversalTime()
 
 
 ## ******** Beginning of LM Helper Methods *****************************************************************************************
@@ -224,6 +236,34 @@ function Make-NotNaN {
     }
 }
 
+function Get-LMActiveDiscoveryOutput {
+    Param (
+        # Custom Hashtable of Objects representing the Veeam Jobs.
+        [Parameter(Mandatory = $true)]
+        $VeeamObjects
+    )
+
+    $lm_output = &#34;&#34;
+
+    # Now Print out the AD-Formatted output
+    ForEach ($VeeamObject in $VeeamObjects) {
+           $tmp_VmID = $VeeamObject.ObjectID
+           $tmp_VmName = $VeeamObject.VmName
+           $tmp_Location = $VeeamObject.Location
+           $tmp_propprefix = &#34;auto.veeam.backupandreplication&#34;
+        
+        $lm_output += &#34;$($tmp_VmID)##$($tmp_VmName)##$($tmp_Location)####$($tmp_propprefix).vmobjectid=$($tmp_VmID)&#38;$($tmp_propprefix).virtualmachinename=$($tmp_VmName)&#38;$($tmp_propprefix).vmlocation=$($tmp_Location)`n&#34;
+
+    }
+
+return $lm_output
+}
+
+$Lookup = @{}
+$Lookup.Add(&#39;Full&#39;,0)
+$Lookup.Add(&#39;Increment&#39;,1)
+
+## ******** Beginning of LM Helper Methods *********************************************************************************************
 
 function Get-VeeamConnection {
     Param (
@@ -274,99 +314,173 @@ function Get-VeeamConnection {
         Write-Host &#34;Error connecting session.  Terminating.&#34;
         Exit
     }
-
+    # Load the Veeam PSSnapIn in the remote session
+    Invoke-Command -Session $veeam_session -ScriptBlock {Add-PSSnapin -Name VeeamPSSnapIn -WarningAction SilentlyContinue -ErrorAction SilentlyContinue}
     return $veeam_session
 }
 
-function Sanitize-Output {
-    param($Metric)
-    if ($Metric.GetType() -eq [Boolean]) {
-        return [int]$Metric
-
-    }
-
-    if ([string]::IsNullOrEmpty($Metric) -or [string]::IsNullOrWhiteSpace($Metric)) {
-        return &#34;null&#34;
-    } else {
-        return $Metric
-    }
-}
-
-### End of LM Helper Methods
-
-Function Get-VeeamRestorePoints {
+function Get-VeeamVirtualMachines {
+    
     Param (
-        # GUID of the Veeam Virtual Machine.
         [Parameter(Mandatory = $true)]
-        [string]
-        $VmId,
+        [System.Management.Automation.Runspaces.PSSession]
+        $VeeamSession,
 
-        $VeeamSession
-
+        [Parameter(Mandatory= $true)]
+        [string]$JobType
+        
     )
 
     $tmp_veeam_objects = @()
-    # Retrieve the restore points
-    $RestorePoints = Invoke-Command -Session $VeeamSession -ScriptBlock {
+    &#60;#
+    ## Make the call to the Veeam PS cmdlet to retrieve the backup jobs
+    $vjs = Invoke-Command -Session $VeeamSession -ScriptBlock {
         Add-PSSnapin -Name VeeamPSSnapIn -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
-        Get-VBRRestorePoint -ObjectId $using:VmId
+        
+   
+        $RemoteJobs = Get-VBRJob -WarningAction SilentlyContinue | Where-Object { $_.JobType -eq &#34;Backup&#34; } | Select-Object -Property *
+        ForEach ($Job in $RemoteJobs) {Get-VBRJobObject -Job $Job.Name | ? {$_.Type -eq &#34;Include&#34;}}
+    
+    }#&#62; #Replace this section with a PS Session.  Working on code below.
+
+    # $RemoteJobs = Get-VBRJob -WarningAction SilentlyContinue | Where-Object { $_.JobType -eq $JobType } | Select-Object -Property *
+    $RemoteJobs = Invoke-Command -Session $VeeamSession -ScriptBlock {Get-VBRJob -WarningAction SilentlyContinue | Where-Object { $_.JobType -eq $Using:JobType } | Select-Object -Property *}
+    
+    ForEach ($Job in $RemoteJobs) {
+        $JobName = $Job.Name
+        #Collect the Job Objects and build a table of virtual machines
+        $JobObjects = Invoke-Command -Session $VeeamSession -ScriptBlock {Get-VBRJobObject -Job $Using:JobName | ? {$_.Type -eq &#34;Include&#34;}}
+        ForEach ($vm in $JobObjects) {
+            $new_veeam_vm = New-Object -TypeName psobject
+            $new_veeam_vm | Add-Member NoteProperty -Name ObjectID -Value $vm.ObjectId
+            $new_veeam_vm | Add-Member NoteProperty -Name VmName -Value $vm.Name
+            $new_veeam_vm | Add-Member NoteProperty -Name Location -Value $vm.Location
+            $new_veeam_vm | Add-Member NoteProperty -Name BackupJobId -Value $vm.JobID
+            $new_veeam_vm | Add-Member NoteProperty -Name BackupJobName -Value $JobName
+            $new_veeam_vm | Add-Member NoteProperty -Name BackupJobType -Value $JobType
+            $tmp_veeam_objects += $new_veeam_vm
+        }
+    
     }
-    # Find the Full restore points and count them.  Excluded &#34;inconsistent/incomplete&#34; fulls
-    $Fulls = $RestorePoints | ? {$_.Type -eq &#34;Full&#34;} | ? {$_.IsConsistent -eq &#34;True&#34;}
-    $FullCount = $Fulls.Count
+    return $tmp_veeam_objects
+}
 
-    # Find the backup increments and cound them. Exclude &#34;inconsistent/incomplete&#34; increments
-    $Increments = $RestorePoints | ? {$_.Type -eq &#34;Increment&#34;} | ? {$_.IsConsistent -eq &#34;True&#34;}
-    $IncrementCount = $Increments.Count
+Function Get-VeeamRestorePoints {
+    Param (
+        [Parameter(Mandatory = $true)]
+        [System.Management.Automation.Runspaces.PSSession]
+        $VeeamSession,
+        
+        # GUID of the Veeam Virtual Machine.
+        [Parameter(Mandatory = $true)]
+        [string]$VmId,
 
-    # Sort the fulls so we can pull the newest and oldest
-   $Fulls = $Fulls | Sort-Object CreationTimeUtc
-   $OldestFull = $Fulls | Select-Object -First 1
-   $NewestFull = $Fulls | Select-Object -Last 1
+        [Parameter(Mandatory = $true)]
+        [string]$JobName
+
+    )
+    # Retrieve the restore points by VMiD and JobName
+    # $RestorePoints = Get-VBRRestorePoint -ObjectId $VmId -Backup $JobName | Select-Object *
+    $RestorePoints = Invoke-Command -Session $VeeamSession -ScriptBlock {Get-VBRRestorePoint -ObjectId $Using:VmId -Backup $Using:JobName | Select-Object *}
+
+    # Get a count of restore points. 
+    [int]$RestorePointCount = $RestorePoints.count
+    # If there is more than 1 RP, find the latest restore point, the fulls, and the increments
+    if ($RestorePointCount -gt 1) {
+
+        # Find the latest consistent Full or Simple restore point and report its size in bytes, type 1=Full 2=Increment 3=Debug, and age in seconds
+        $LatestRp = $RestorePoints | ? {$_.IsConsistent -eq &#34;True&#34;} | Sort-Object CreationTimeUtc | Select-Object -Last 1
+        [datetime]$LatestCreationTimeUtc = $LatestRp.CreationTimeUtc
+        [int64]$LatestAgeSec = (New-Timespan -Start $LatestCreationTimeUtc -End $Now).TotalSeconds
+        [string]$LatestType = $LatestRp.Type
+        [string]$TypeReturn = $Lookup.$($LatestType)
+        [string]$LatestSize = $LatestRp.ApproxSize
+    
+        # Find the Full restore points and count them.  Excluded &#34;inconsistent/incomplete&#34; fulls
+        $Fulls = $RestorePoints | ? {$_.Type.Value -eq &#34;Full&#34;} | ? {$_.IsConsistent -eq &#34;True&#34;}
+        $FullCount = $Fulls.Count
+
+        # Find the backup increments and cound them. Exclude &#34;inconsistent/incomplete&#34; increments
+        $Increments = $RestorePoints | ? {$_.Type.Value -eq &#34;Increment&#34;} | ? {$_.IsConsistent -eq &#34;True&#34;}
+        $IncrementCount = $Increments.Count
+
+        # Sort the fulls so we can pull the newest and oldest
+       $Fulls = $Fulls | Sort-Object CreationTimeUtc
+       $OldestFull = $Fulls | Select-Object -First 1
+       $NewestFull = $Fulls | Select-Object -Last 1
    
-   # Find the creationdata of the oldest full and return in in epoch time
-   [datetime]$OldFullCreationUtc = $OldestFull.CreationTimeUtc
-   #[int64]$OldFullEpochTime = (New-Timespan -Start $EpochStart -End $OldFullCreationUtc).TotalSeconds
-   [int64]$OldFullAgeSec = (New-Timespan -Start $OldFullCreationUtc -End $Now).TotalSeconds
+       # Find the creationdata of the oldest full and return in in epoch time
+       [datetime]$OldFullCreationUtc = $OldestFull.CreationTimeUtc
+       [int64]$OldFullAgeSec = (New-Timespan -Start $OldFullCreationUtc -End $Now).TotalSeconds
 
-   # Find the creationdate of the newest full and return it in Unix Epoch time
-   [datetime]$NewFullCreationUtc = $NewestFull.CreationTimeUtc
-   # [int64]$NewFullEpochTime = (New-TimeSpan -Start $EpochStart -End $NewFullCreationUtc).TotalSeconds
-   [int64]$NewFullAgeSec = (New-Timespan -Start $NewFullCreationUtc -End $Now).TotalSeconds
+       # Find the creationdate of the newest full and return it in Unix Epoch time
+       [datetime]$NewFullCreationUtc = $NewestFull.CreationTimeUtc
+       [int64]$NewFullAgeSec = (New-Timespan -Start $NewFullCreationUtc -End $Now).TotalSeconds
    
 
-   # Sort the incremenets so we can pull the newest and oldest
-   $Increments = $Increments | Sort-Object CreationTimeUtc
-   $OldestIncrement = $Increments | Select-Object -First 1
-   $NewestIncrement = $Increments | Select-Object -Last 1
+       # Sort the incremenets so we can pull the newest and oldest
+       $Increments = $Increments | Sort-Object CreationTimeUtc
+       $OldestIncrement = $Increments | Select-Object -First 1
+       $NewestIncrement = $Increments | Select-Object -Last 1
 
-   #Find the creationdate of the oldest increment and return in epoch time
-   [datetime]$OldIncrementCreationUtc = $OldestIncrement.CreationTimeUtc
-   # [int64]$OldIncEpochTime = (New-Timespan -Start $EpochStart -End $OldIncrementCreationUtc).TotalSeconds
-   [int64]$OldIncAgeSec = (New-Timespan -Start $OldIncrementCreationUtc -End $Now).TotalSeconds
+       #Find the creationdate of the oldest increment and return in epoch time
+       [datetime]$OldIncrementCreationUtc = $OldestIncrement.CreationTimeUtc
+       [int64]$OldIncAgeSec = (New-Timespan -Start $OldIncrementCreationUtc -End $Now).TotalSeconds
 
 
-   # Find the creationdate of the newest increment and return in epoch time
-   [datetime]$NewIncrementCreationUtc = $NewestIncrement.CreationTimeUtc
-   # [int64]$NewIncEpochTime = (New-TimeSpan -Start $EpochStart -End $NewIncrementCreationUtc).TotalSeconds
-   [int64]$NewIncAgeSec = (New-Timespan -Start $NewIncrementCreationUtc -End $Now).TotalSeconds
+       # Find the creationdate of the newest increment and return in epoch time
+       [datetime]$NewIncrementCreationUtc = $NewestIncrement.CreationTimeUtc
+       [int64]$NewIncAgeSec = (New-Timespan -Start $NewIncrementCreationUtc -End $Now).TotalSeconds
 
-   # Write out the data to return to Logicmonitor
-   # Write-Host &#34;$( $wildvalue ).Status=$( Sanitize-Output $task.Status )&#34;
+       # Write out the data to return to Logicmonitor
+       # Write-Host &#34;$( $wildvalue ).Status=$( Sanitize-Output $task.Status )&#34;
+      
+       Write-Host &#34;$( $VmId ).LatestType=$( Sanitize-Output $TypeReturn )&#34;
+       Write-Host &#34;$( $VmId ).LatestSize=$( Sanitize-Output $LatestSize )&#34;
+       Write-Host &#34;$( $VmId ).LatestAge=$( Sanitize-Output $LatestAgeSec )&#34;
+       Write-Host &#34;$( $VmId ).FullCount=$( Sanitize-Output $FullCount )&#34;
+       Write-Host &#34;$( $VmId ).IncCount=$( Sanitize-Output $IncrementCount )&#34;
+       Write-Host &#34;$( $VmId ).OldestFull=$( Sanitize-Output $OldFullAgeSec )&#34;
+       Write-Host &#34;$( $VmId ).NewestFull=$( Sanitize-Output $NewFullAgeSec )&#34;
+       Write-Host &#34;$( $VmId ).OldestIncrement=$( Sanitize-Output $OldIncAgeSec )&#34;
+       Write-Host &#34;$( $VmId ).NewestIncrement=$( Sanitize-Output $NewIncAgeSec )&#34;
 
-   Write-Host &#34;$( $VmId ).FullCount=$( Sanitize-Output $FullCount )&#34;
-   Write-Host &#34;$( $VmId ).IncCount=$( Sanitize-Output $IncrementCount )&#34;
-   Write-Host &#34;$( $VmId ).OldestFull=$( Sanitize-Output $OldFullAgeSec )&#34;
-   Write-Host &#34;$( $VmId ).NewestFull=$( Sanitize-Output $NewFullAgeSec )&#34;
-   Write-Host &#34;$( $VmId ).OldestIncrement=$( Sanitize-Output $OldIncAgeSec )&#34;
-   Write-Host &#34;$( $VmId ).NewestIncrement=$( Sanitize-Output $NewIncAgeSec )&#34;
+       }
+       # Else, pull stats for the single restore point
+       else {
+       $LatestRp = $RestorePoints
 
+        [datetime]$LatestCreationTimeUtc = $LatestRp.CreationTimeUtc
+        [int64]$LatestAgeSec = (New-Timespan -Start $LatestCreationTimeUtc -End $Now).TotalSeconds
+        [string]$LatestType = $LatestRp.Type
+        [string]$TypeReturn = $Lookup.$($LatestType)
+        [string]$LatestSize = $LatestRp.ApproxSize
+        
+        Write-Host &#34;$( $VmId ).LatestType=$( Sanitize-Output $TypeReturn )&#34;
+        Write-Host &#34;$( $VmId ).LatestSize=$( Sanitize-Output $LatestSize )&#34;
+        Write-Host &#34;$( $VmId ).LatestAge=$( Sanitize-Output $LatestAgeSec )&#34;
+        Write-Host &#34;$( $VmId ).FullCount=$( Sanitize-Output &#34;1&#34; )&#34;
+        Write-Host &#34;$( $VmId ).IncCount=$( Sanitize-Output &#34;0&#34; )&#34;
+        Write-Host &#34;$( $VmId ).OldestFull=$( Sanitize-Output $LatestAgeSec )&#34;
+        Write-Host &#34;$( $VmId ).NewestFull=$( Sanitize-Output $LatestAgeSec )&#34;
+        Write-Host &#34;$( $VmId ).OldestIncrement=$( Sanitize-Output &#34;0&#34; )&#34;
+        Write-Host &#34;$( $VmId ).NewestIncrement=$( Sanitize-Output &#34;0&#34; )&#34;
+
+       }
 }
 
 
 ## ******** Beginning of the main routine *********************************************************************************************
+# Add-PSSnapin -Name VeeamPSSnapIn -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
 $veeam_session = Get-VeeamConnection -VeeamHostname $hostname -VeeamUsername $veeam_user -VeeamPassword $veeam_pass
-$veeam_objects = Get-VeeamRestorePoints -VmId $VmId -VeeamSession $veeam_session
+
+# Get the Veeam Virtual Machines included in Backup Jobs
+$veeam_objects = Get-VeeamVirtualMachines -VeeamSession $veeam_session -JobType &#34;Backup&#34;
+
+Foreach ($vm in $veeam_objects) {
+    # Write-Warning &#34;Starting VM $($vm.VmName)&#34;
+    Get-VeeamRestorePoints -VeeamSession $veeam_session -VmId $vm.ObjectID -JobName $vm.BackupJobName
+}
 
 Exit</value>
             <comment></comment>
@@ -394,40 +508,106 @@ Exit</value>
         </attributes>
         <datapoints>
         <datapoint>
-            <name>IncCount</name>
-            <dataType>7</dataType>
-            <type>2</type>
-            <postprocessormethod>namevalue</postprocessormethod>
-            <postprocessorparam>##WILDVALUE##.IncCount</postprocessorparam>
-            <usevalue>output</usevalue>
-            <alertexpr></alertexpr>
-            <alertmissing>1</alertmissing>
-            <alertsubject></alertsubject>
-            <alertbody></alertbody>
-            <description>A count of the number of simple restore points (increments) found for the associated instance.</description>
-            <maxvalue></maxvalue>
-            <minvalue>0</minvalue>
-            <userparam1></userparam1>
-            <userparam2></userparam2>
-            <userparam3></userparam3>
-            <iscomposite>false</iscomposite>
-            <rpn></rpn>
-            <alertTransitionIval>0</alertTransitionIval>
-            <alertClearTransitionIval>0</alertClearTransitionIval>
-        </datapoint>
-        <datapoint>
             <name>FullCount</name>
             <dataType>7</dataType>
             <type>2</type>
             <postprocessormethod>namevalue</postprocessormethod>
-            <postprocessorparam>##WILDVALUE##.FullCount</postprocessorparam>
+            <postprocessorparam>FullCount</postprocessorparam>
             <usevalue>output</usevalue>
             <alertexpr></alertexpr>
             <alertmissing>1</alertmissing>
             <alertsubject></alertsubject>
             <alertbody></alertbody>
-            <description>A count of completed full backup points found for the associated instance.</description>
+            <description>A count of full restore points</description>
             <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>IncrementCount</name>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>IncCount</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <description>A count of the incremental restore points (simple restore points)</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>LatestAgeSec</name>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>LatestAge</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <description>The age of the latest restore point of either type expressed in seconds</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>LatestSizeBytes</name>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>LatestSize</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <description>The approximate size of the most recent restore point in bytes.</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>LatestType</name>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>LatestType</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <description>The type of the most recent restore point.  0 = Full; 1 = Increment</description>
+            <maxvalue>1</maxvalue>
             <minvalue>0</minvalue>
             <userparam1></userparam1>
             <userparam2></userparam2>
@@ -438,17 +618,17 @@ Exit</value>
             <alertClearTransitionIval>0</alertClearTransitionIval>
         </datapoint>
         <datapoint>
-            <name>NewestFull</name>
+            <name>NewestFullSeconds</name>
             <dataType>7</dataType>
             <type>2</type>
             <postprocessormethod>namevalue</postprocessormethod>
-            <postprocessorparam>##WILDVALUE##.NewestFull</postprocessorparam>
+            <postprocessorparam>NewestFull</postprocessorparam>
             <usevalue>output</usevalue>
             <alertexpr></alertexpr>
             <alertmissing>1</alertmissing>
             <alertsubject></alertsubject>
             <alertbody></alertbody>
-            <description>The age of the  newest complete full restore point found for a given instance expressed in seconds.</description>
+            <description>The age of the newest Full restore point expressed in seconds</description>
             <maxvalue></maxvalue>
             <minvalue></minvalue>
             <userparam1></userparam1>
@@ -460,17 +640,17 @@ Exit</value>
             <alertClearTransitionIval>0</alertClearTransitionIval>
         </datapoint>
         <datapoint>
-            <name>NewestIncrement</name>
+            <name>NewestIncrementSec</name>
             <dataType>7</dataType>
             <type>2</type>
             <postprocessormethod>namevalue</postprocessormethod>
-            <postprocessorparam>##WILDVALUE##.NewestIncrement</postprocessorparam>
+            <postprocessorparam>NewestIncrement</postprocessorparam>
             <usevalue>output</usevalue>
             <alertexpr></alertexpr>
             <alertmissing>1</alertmissing>
             <alertsubject></alertsubject>
             <alertbody></alertbody>
-            <description>The age of the newest complete simple/incremental restore point found for a given instance expressed in seconds.</description>
+            <description>The age of the newest incremental (simple) restore point expressed in seconds</description>
             <maxvalue></maxvalue>
             <minvalue></minvalue>
             <userparam1></userparam1>
@@ -482,17 +662,17 @@ Exit</value>
             <alertClearTransitionIval>0</alertClearTransitionIval>
         </datapoint>
         <datapoint>
-            <name>OldestFull</name>
+            <name>OldestFullSeconds</name>
             <dataType>7</dataType>
             <type>2</type>
             <postprocessormethod>namevalue</postprocessormethod>
-            <postprocessorparam>##WILDVALUE##.OldestFull</postprocessorparam>
+            <postprocessorparam>OldestFull</postprocessorparam>
             <usevalue>output</usevalue>
             <alertexpr></alertexpr>
             <alertmissing>1</alertmissing>
             <alertsubject></alertsubject>
             <alertbody></alertbody>
-            <description>The age of the oldest complete full restore point found for a given instance expressed in seconds.</description>
+            <description>The age of the oldest Full restore point expressed in seconds</description>
             <maxvalue></maxvalue>
             <minvalue></minvalue>
             <userparam1></userparam1>
@@ -504,105 +684,17 @@ Exit</value>
             <alertClearTransitionIval>0</alertClearTransitionIval>
         </datapoint>
         <datapoint>
-            <name>OldestIncrement</name>
+            <name>OldestIncrementSeconds</name>
             <dataType>7</dataType>
             <type>2</type>
             <postprocessormethod>namevalue</postprocessormethod>
-            <postprocessorparam>##WILDVALUE##.OldestIncrement</postprocessorparam>
+            <postprocessorparam>OldestIncrement</postprocessorparam>
             <usevalue>output</usevalue>
             <alertexpr></alertexpr>
             <alertmissing>1</alertmissing>
             <alertsubject></alertsubject>
             <alertbody></alertbody>
-            <description>The age of the oldest complete simple/incremental restore point found for a given instance expressed in seconds.</description>
-            <maxvalue></maxvalue>
-            <minvalue></minvalue>
-            <userparam1></userparam1>
-            <userparam2></userparam2>
-            <userparam3></userparam3>
-            <iscomposite>false</iscomposite>
-            <rpn></rpn>
-            <alertTransitionIval>0</alertTransitionIval>
-            <alertClearTransitionIval>0</alertClearTransitionIval>
-        </datapoint>
-        <datapoint>
-            <name>NewestFullAgeHours</name>
-            <dataType>7</dataType>
-            <type>2</type>
-            <postprocessormethod>expression</postprocessormethod>
-            <postprocessorparam>NewestFull/3600</postprocessorparam>
-            <usevalue></usevalue>
-            <alertexpr></alertexpr>
-            <alertmissing>1</alertmissing>
-            <alertsubject></alertsubject>
-            <alertbody></alertbody>
-            <description></description>
-            <maxvalue></maxvalue>
-            <minvalue></minvalue>
-            <userparam1></userparam1>
-            <userparam2></userparam2>
-            <userparam3></userparam3>
-            <iscomposite>false</iscomposite>
-            <rpn></rpn>
-            <alertTransitionIval>0</alertTransitionIval>
-            <alertClearTransitionIval>0</alertClearTransitionIval>
-        </datapoint>
-        <datapoint>
-            <name>NewestIncrementHours</name>
-            <dataType>7</dataType>
-            <type>2</type>
-            <postprocessormethod>expression</postprocessormethod>
-            <postprocessorparam>NewestIncrement/3600</postprocessorparam>
-            <usevalue></usevalue>
-            <alertexpr></alertexpr>
-            <alertmissing>1</alertmissing>
-            <alertsubject></alertsubject>
-            <alertbody></alertbody>
-            <description></description>
-            <maxvalue></maxvalue>
-            <minvalue></minvalue>
-            <userparam1></userparam1>
-            <userparam2></userparam2>
-            <userparam3></userparam3>
-            <iscomposite>false</iscomposite>
-            <rpn></rpn>
-            <alertTransitionIval>0</alertTransitionIval>
-            <alertClearTransitionIval>0</alertClearTransitionIval>
-        </datapoint>
-        <datapoint>
-            <name>OldestFullHours</name>
-            <dataType>7</dataType>
-            <type>2</type>
-            <postprocessormethod>expression</postprocessormethod>
-            <postprocessorparam>OldestFull/3600</postprocessorparam>
-            <usevalue></usevalue>
-            <alertexpr></alertexpr>
-            <alertmissing>1</alertmissing>
-            <alertsubject></alertsubject>
-            <alertbody></alertbody>
-            <description></description>
-            <maxvalue></maxvalue>
-            <minvalue></minvalue>
-            <userparam1></userparam1>
-            <userparam2></userparam2>
-            <userparam3></userparam3>
-            <iscomposite>false</iscomposite>
-            <rpn></rpn>
-            <alertTransitionIval>0</alertTransitionIval>
-            <alertClearTransitionIval>0</alertClearTransitionIval>
-        </datapoint>
-        <datapoint>
-            <name>OldestIncrementHours</name>
-            <dataType>7</dataType>
-            <type>2</type>
-            <postprocessormethod>expression</postprocessormethod>
-            <postprocessorparam>OldestIncrement/3600</postprocessorparam>
-            <usevalue></usevalue>
-            <alertexpr></alertexpr>
-            <alertmissing>1</alertmissing>
-            <alertsubject></alertsubject>
-            <alertbody></alertbody>
-            <description></description>
+            <description>The age of the oldest incremental (simple) restore point expressed in seconds</description>
             <maxvalue></maxvalue>
             <minvalue></minvalue>
             <userparam1></userparam1>
@@ -615,68 +707,8 @@ Exit</value>
         </datapoint>
         </datapoints>
         <graphs>
-        <graph>
-            <name>Newest Simple Restore Point (Instance)</name>
-            <title>Newest Simple Restore Point (Instance)</title>
-            <verticallabel>Hours</verticallabel>
-            <rigid>false</rigid>
-            <maxvalue>NaN</maxvalue>
-            <minvalue>0.0</minvalue>
-            <displayprio>1</displayprio>
-            <timescale>1week</timescale>
-            <base1024>false</base1024>
-            <graphdatapoints>
-        <graphdatapoint>
-            <name>NewestIncrementHours</name>
-            <datapointname>NewestIncrementHours</datapointname>
-            <cf>1</cf>
-        </graphdatapoint>
-            </graphdatapoints>
-            <graphvirtualdatapoints>
-            </graphvirtualdatapoints>
-            <graphdatas>
-            <graphdata>
-                <type>1</type>
-                <legend>NewestIncrementHours</legend>
-                <color>silver</color>
-                <datapointname>NewestIncrementHours</datapointname>
-                <isvirtualdatapoint>false</isvirtualdatapoint>
-            </graphdata>
-            </graphdatas>
-        </graph>
         </graphs>
         <overviewgraphs>
-        <overviewgraph>
-            <name>Newest Simple Restore Points</name>
-            <title>Newest Simple Restore Points</title>
-            <verticallabel>Hours</verticallabel>
-            <rigid>false</rigid>
-            <maxvalue>NaN</maxvalue>
-            <minvalue>0.0</minvalue>
-            <displayprio>1</displayprio>
-            <timescale>1week</timescale>
-            <base1024>false</base1024>
-            <aggregated>false</aggregated>
-            <datapoints>
-        <overviewgraphdatapoint>
-            <name>NewestIncrementHours</name>
-            <datapointname>NewestIncrementHours</datapointname>
-            <cf>1</cf>
-            <aggregateMethod>average</aggregateMethod>
-        </overviewgraphdatapoint>
-            </datapoints>
-            <virtualdatapoints>
-            </virtualdatapoints>
-            <lines>
-            <overviewgraphline>
-                <type>1</type>
-                <legend>##INSTANCE##</legend>
-                <datapointname>NewestIncrementHours</datapointname>
-                <isvirtualdatapoint>false</isvirtualdatapoint>
-                <color>AUTO</color>
-            </overviewgraphline>
-            </lines>
-        </overviewgraph>
         </overviewgraphs>
         <scripts>
         </scripts>
